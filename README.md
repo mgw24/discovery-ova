@@ -1,1 +1,3 @@
 # discovery-ova
+# script to install common network monitoring and discovery tools on ubuntu minimal
+# SHA256=ee22e111dd6839ce42d17cc8414085d5483d09a9a1438047a033936c39747db2
