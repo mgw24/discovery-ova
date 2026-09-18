@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Discovery-OVA builder for Ubuntu Server Minimal
-# Version: 0.4.0 (2026-09-17)
+# Version: 0.5.0 (2026-09-17)
 # Target: Ubuntu Server 26.04 LTS amd64 on VMware vSphere/ESXi
 #
 # One script, staged internally.  It can install, validate, reconfigure credentials,
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 umask 027
 
 SELF="$(readlink -f "$0")"
-VERSION="0.4.1"
+VERSION="0.5.0"
 DISCOVERY_OVA_ROOT="/opt/discovery-ova"
 ETC_ROOT="/etc/discovery-ova"
 STATE_ROOT="/var/lib/discovery-ova"
@@ -41,6 +41,11 @@ LOKI_IMAGE="grafana/loki:3.7.3"
 ALLOY_IMAGE="grafana/alloy:v1.19.2"
 NODE_EXPORTER_IMAGE="prom/node-exporter:v1.12.1"
 CADVISOR_IMAGE="ghcr.io/google/cadvisor:v0.60.5"
+GUACAMOLE_IMAGE="guacamole/guacamole:1.6.0"
+GUACD_IMAGE="guacamole/guacd:1.6.0"
+BLACKBOX_IMAGE="ghcr.io/prometheus/blackbox-exporter@sha256:9afaf166144b91c3d1d1f2a8ad143516365ec5d2b61579663c03641572e119d9"
+TELEGRAF_IMAGE="telegraf:1.40.0"
+REDFISH_IMAGE="ghcr.io/mrlhansen/idrac_exporter:v2.6.2"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -149,6 +154,7 @@ Usage:
   sudo bash $0 rekey         Change operator credentials and refresh app admins
   sudo bash $0 smtp          Configure or disable boot-address email
   sudo bash $0 backup-remote Configure Farva/SSH remote backup settings
+  sudo bash $0 remote        Configure vSphere, Redfish and Pure remote monitoring
   sudo bash $0 seal          Clean unique guest identity before OVA export
   sudo bash $0 discover      Read-only discovery report
 
@@ -167,6 +173,13 @@ preflight_os() {
     *) die "Supported base releases are Ubuntu 26.04 LTS and 24.04 LTS; found ${VERSION_ID:-unknown}." ;;
   esac
   [[ "$(dpkg --print-architecture)" == "amd64" ]] || die "This OVA build currently targets amd64."
+  local cpus mem_gb root_gb
+  cpus="$(nproc)"
+  mem_gb="$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 / 1024 ))"
+  root_gb="$(df -BG --output=size / | tail -1 | tr -dc '0-9')"
+  (( cpus >= 8 )) || warn "Only $cpus vCPU detected. Discovery-OVA v0.5 recommends 12 vCPU (8 minimum for a small lab)."
+  (( mem_gb >= 16 )) || warn "Only ${mem_gb} GiB RAM detected. Discovery-OVA v0.5 recommends 24 GiB."
+  (( root_gb >= 180 )) || warn "Root filesystem is only ${root_gb} GiB. The all-in-one build recommends a 300 GB thin VMDK/root filesystem."
 }
 
 discover() {
@@ -245,7 +258,7 @@ collect_settings() {
     source "$SECRETS_FILE"
   fi
   if [[ -z "${OPERATOR_PASSWORD:-}" ]]; then
-    prompt_secret "Password for Nginx/Grafana/LibreNMS operator '$OPERATOR_USER'" OPERATOR_PASSWORD 12
+    prompt_secret "Password for Nginx/Grafana/LibreNMS/Guacamole operator '$OPERATOR_USER'" OPERATOR_PASSWORD 12
   elif (( existing )); then
     echo "Reusing the existing root-only operator credential for this repair run. Use '$SELF rekey' to rotate it."
   fi
@@ -255,6 +268,8 @@ collect_settings() {
   GRAFANA_SECRET_KEY="${GRAFANA_SECRET_KEY:-$(random_secret)}"
   LIBRESPEED_RESULTS_PASSWORD="${LIBRESPEED_RESULTS_PASSWORD:-$(random_secret)}"
   SNMP_COMMUNITY="${SNMP_COMMUNITY:-$(openssl rand -hex 16)}"
+  GUAC_DB_PASSWORD="${GUAC_DB_PASSWORD:-$(random_secret)}"
+  GUAC_DB_ROOT_PASSWORD="${GUAC_DB_ROOT_PASSWORD:-$(random_secret)}"
 
   install -d -m 0700 "$ETC_ROOT" "$STATE_ROOT" "$RUN_ROOT"
   write_file "$CONF_FILE" 0600 root:root <<EOF
@@ -276,6 +291,8 @@ EOF
     printf 'GRAFANA_SECRET_KEY=%q\n' "$GRAFANA_SECRET_KEY"
     printf 'LIBRESPEED_RESULTS_PASSWORD=%q\n' "$LIBRESPEED_RESULTS_PASSWORD"
     printf 'SNMP_COMMUNITY=%q\n' "$SNMP_COMMUNITY"
+    printf 'GUAC_DB_PASSWORD=%q\n' "$GUAC_DB_PASSWORD"
+    printf 'GUAC_DB_ROOT_PASSWORD=%q\n' "$GUAC_DB_ROOT_PASSWORD"
   } | write_file "$SECRETS_FILE" 0600 root:root
 
   export OPERATOR_PASSWORD
@@ -294,7 +311,8 @@ ensure_dirs_user() {
   for d in librenms smokeping/config smokeping/data librespeed scanner captures ntopng alloy node-exporter cadvisor; do
     install -d -m 0750 -o discovery-ova -g discovery-ova "$DATA_DIR/$d"
   done
-  install -d -m 0750 -o root -g root "$DATA_DIR/db" "$DATA_DIR/redis"
+  install -d -m 0750 -o root -g root "$DATA_DIR/db" "$DATA_DIR/redis" "$DATA_DIR/guacamole-db"
+  install -d -m 0750 -o root -g discovery-ova "$CONFIG_DIR/guacamole" "$CONFIG_DIR/blackbox" "$CONFIG_DIR/telegraf" "$CONFIG_DIR/redfish"
   install -d -m 0750 -o 472 -g 472 "$DATA_DIR/grafana"
   install -d -m 0750 -o 65534 -g 65534 "$DATA_DIR/prometheus"
   install -d -m 0750 -o 10001 -g 10001 "$DATA_DIR/loki"
@@ -311,7 +329,7 @@ install_packages() {
   apt-get install -y \
     ca-certificates curl gnupg jq openssl apache2-utils \
     network-manager netplan.io nginx rsyslog avahi-daemon \
-    nmap tcpdump ethtool iw iproute2 iputils-ping dnsutils iperf3 lldpd \
+    nmap tcpdump ethtool iproute2 iputils-ping dnsutils iperf3 lldpd \
     python3 python3-flask gunicorn sqlite3 \
     open-vm-tools ufw openssh-server tar gzip xz-utils rsync \
     util-linux systemd-timesyncd
@@ -681,10 +699,118 @@ resolve_ntop_image() {
   printf '%s' "$digest"
 }
 
-write_observability_configs() {
-  install -d -m 0750 "$CONFIG_DIR/prometheus" "$CONFIG_DIR/loki" "$CONFIG_DIR/alloy" "$CONFIG_DIR/grafana/provisioning/datasources" "$CONFIG_DIR/grafana/provisioning/dashboards" "$CONFIG_DIR/grafana/dashboards"
+write_remote_base_configs() {
+  install -d -m 0750 -o root -g discovery-ova \
+    "$CONFIG_DIR/prometheus" "$CONFIG_DIR/blackbox" "$CONFIG_DIR/telegraf" "$CONFIG_DIR/redfish" "$CONFIG_DIR/guacamole"
 
-  write_file "$CONFIG_DIR/prometheus/prometheus.yml" 0644 root:root <<'EOF'
+  [[ -s "$CONFIG_DIR/prometheus/blackbox-targets.json" ]] || \
+    write_file "$CONFIG_DIR/prometheus/blackbox-targets.json" 0640 root:discovery-ova <<'EOF'
+[]
+EOF
+
+  write_file "$CONFIG_DIR/blackbox/blackbox.yml" 0644 root:root <<'EOF'
+modules:
+  icmp:
+    prober: icmp
+    timeout: 5s
+    icmp:
+      preferred_ip_protocol: ip4
+  http_2xx:
+    prober: http
+    timeout: 10s
+    http:
+      preferred_ip_protocol: ip4
+      method: GET
+  https_insecure:
+    prober: http
+    timeout: 10s
+    http:
+      preferred_ip_protocol: ip4
+      method: GET
+      tls_config:
+        insecure_skip_verify: true
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: ip4
+  dns_udp:
+    prober: dns
+    timeout: 5s
+    dns:
+      preferred_ip_protocol: ip4
+      transport_protocol: udp
+      query_name: example.com
+      query_type: A
+EOF
+
+  write_file "$CONFIG_DIR/telegraf/vsphere.conf" 0644 root:root <<'EOF'
+[agent]
+  interval = "60s"
+  round_interval = true
+  flush_interval = "15s"
+
+[[inputs.vsphere]]
+  vcenters = ["${VCENTER_URL}"]
+  username = "${VCENTER_USERNAME}"
+  password = "${VCENTER_PASSWORD}"
+  insecure_skip_verify = ${VCENTER_INSECURE}
+  collect_concurrency = 5
+  discover_concurrency = 5
+
+[[outputs.prometheus_client]]
+  listen = ":9273"
+  metric_version = 2
+  path = "/metrics"
+EOF
+
+  if [[ ! -s "$ETC_ROOT/vsphere.env" ]]; then
+    write_file "$ETC_ROOT/vsphere.env" 0600 root:root <<'EOF'
+VCENTER_URL=https://127.0.0.1/sdk
+VCENTER_USERNAME=disabled
+VCENTER_PASSWORD=disabled
+VCENTER_INSECURE=true
+EOF
+  fi
+  [[ -s "$ETC_ROOT/vsphere.json" ]] || write_file "$ETC_ROOT/vsphere.json" 0600 root:root <<'EOF'
+{"enabled":false}
+EOF
+  [[ -s "$ETC_ROOT/redfish.json" ]] || write_file "$ETC_ROOT/redfish.json" 0600 root:root <<'EOF'
+{"enabled":false,"targets":[]}
+EOF
+  [[ -s "$ETC_ROOT/pure-monitoring.json" ]] || write_file "$ETC_ROOT/pure-monitoring.json" 0600 root:root <<'EOF'
+{"enabled":false,"arrays":[]}
+EOF
+
+  if [[ ! -s "$CONFIG_DIR/redfish/idrac.yml" ]]; then
+    write_file "$CONFIG_DIR/redfish/idrac.yml" 0600 root:root <<'EOF'
+address: 0.0.0.0
+port: 9348
+timeout: 20
+hosts:
+  default:
+    username: disabled
+    password: disabled
+    scheme: https
+metrics:
+  system: true
+  sensors: true
+  power: true
+  storage: true
+  memory: true
+  network: true
+  manager: true
+EOF
+  fi
+  [[ -s "$CONFIG_DIR/prometheus/redfish-targets.json" ]] || write_file "$CONFIG_DIR/prometheus/redfish-targets.json" 0640 root:discovery-ova <<'EOF'
+[]
+EOF
+}
+
+write_prometheus_config() {
+  local tmp enabled url name token insecure
+  tmp="$(mktemp)"
+  cat >"$tmp" <<'EOF'
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
@@ -698,7 +824,229 @@ scrape_configs:
   - job_name: prometheus
     static_configs:
       - targets: ['prometheus:9090']
+  - job_name: blackbox-exporter
+    static_configs:
+      - targets: ['blackbox-exporter:9115']
+  - job_name: blackbox
+    metrics_path: /probe
+    file_sd_configs:
+      - files: ['/etc/prometheus/blackbox-targets.json']
+        refresh_interval: 15s
+    relabel_configs:
+      - source_labels: [module]
+        target_label: __param_module
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - source_labels: [name]
+        target_label: target_name
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
 EOF
+
+  enabled="$(jq -r '.enabled // false' "$ETC_ROOT/vsphere.json" 2>/dev/null || echo false)"
+  if [[ "$enabled" == true ]]; then
+    cat >>"$tmp" <<'EOF'
+  - job_name: vsphere
+    scrape_interval: 60s
+    scrape_timeout: 55s
+    static_configs:
+      - targets: ['telegraf-vsphere:9273']
+EOF
+  fi
+
+  enabled="$(jq -r '.enabled // false' "$ETC_ROOT/redfish.json" 2>/dev/null || echo false)"
+  if [[ "$enabled" == true ]]; then
+    cat >>"$tmp" <<'EOF'
+  - job_name: redfish
+    scrape_interval: 120s
+    scrape_timeout: 110s
+    file_sd_configs:
+      - files: ['/etc/prometheus/redfish-targets.json']
+        refresh_interval: 30s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: redfish-exporter:9348
+EOF
+  fi
+
+  enabled="$(jq -r '.enabled // false' "$ETC_ROOT/pure-monitoring.json" 2>/dev/null || echo false)"
+  if [[ "$enabled" == true ]]; then
+    while IFS=$'\t' read -r name url token insecure; do
+      [[ -n "$url" && -n "$token" ]] || continue
+      # Prometheus basic YAML scalar safety: setup rejects whitespace/newlines in name/address; tokens are JSON-decoded here.
+      cat >>"$tmp" <<EOF
+  - job_name: purefa_${name}_array
+    scheme: https
+    metrics_path: /metrics/array
+    scrape_interval: 60s
+    scrape_timeout: 55s
+    authorization:
+      credentials: '$token'
+    tls_config:
+      insecure_skip_verify: $insecure
+    static_configs:
+      - targets: ['$url']
+        labels: {array: '$name'}
+  - job_name: purefa_${name}_hosts
+    scheme: https
+    metrics_path: /metrics/hosts
+    scrape_interval: 60s
+    scrape_timeout: 55s
+    authorization:
+      credentials: '$token'
+    tls_config:
+      insecure_skip_verify: $insecure
+    static_configs:
+      - targets: ['$url']
+        labels: {array: '$name'}
+  - job_name: purefa_${name}_volumes
+    scheme: https
+    metrics_path: /metrics/volumes
+    scrape_interval: 60s
+    scrape_timeout: 55s
+    authorization:
+      credentials: '$token'
+    tls_config:
+      insecure_skip_verify: $insecure
+    static_configs:
+      - targets: ['$url']
+        labels: {array: '$name'}
+EOF
+    done < <(jq -r '.arrays[]? | [.name,.address,.token,(.insecure|tostring)] | @tsv' "$ETC_ROOT/pure-monitoring.json" 2>/dev/null)
+  fi
+
+  backup_path "$CONFIG_DIR/prometheus/prometheus.yml"
+  install -m 0640 -o root -g discovery-ova "$tmp" "$CONFIG_DIR/prometheus/prometheus.yml"
+  rm -f "$tmp"
+}
+
+configure_remote_monitoring_interactive() {
+  require_root
+  load_conf
+  install -d -m 0700 "$ETC_ROOT"
+  local ans vc user pass insecure url target targets_json rf_user rf_pass name address token pure_json safe_name
+
+  echo "Remote infrastructure monitoring configuration"
+  echo "Secrets are entered here with hidden input and stored in root-only files."
+
+  read -r -p "Configure VMware vSphere/vCenter monitoring? [y/N]: " ans
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    read -r -p "vCenter hostname or URL: " vc
+    [[ -n "$vc" && "$vc" != *[[:space:]]* ]] || die "Invalid vCenter value."
+    if [[ "$vc" != http://* && "$vc" != https://* ]]; then vc="https://$vc"; fi
+    [[ "$vc" == */sdk ]] || vc="${vc%/}/sdk"
+    read -r -p "vCenter read-only username: " user
+    read -r -s -p "vCenter password: " pass; echo
+    [[ -n "$user" && -n "$pass" ]] || die "vCenter username/password cannot be empty."
+    read -r -p "Allow self-signed/unverified vCenter TLS certificate? [Y/n]: " ans
+    [[ "$ans" =~ ^[Nn]$ ]] && insecure=false || insecure=true
+    {
+      printf 'VCENTER_URL=%s\n' "$(jq -Rn --arg v "$vc" '$v')"
+      printf 'VCENTER_USERNAME=%s\n' "$(jq -Rn --arg v "$user" '$v')"
+      printf 'VCENTER_PASSWORD=%s\n' "$(jq -Rn --arg v "$pass" '$v')"
+      printf 'VCENTER_INSECURE=%s\n' "$insecure"
+    } | write_file "$ETC_ROOT/vsphere.env" 0600 root:root
+    jq -n --arg url "$vc" '{enabled:true,url:$url}' | write_file "$ETC_ROOT/vsphere.json" 0600 root:root
+    (cd "$COMPOSE_DIR" && docker compose --profile vsphere up -d telegraf-vsphere)
+  else
+    write_file "$ETC_ROOT/vsphere.json" 0600 root:root <<'EOF'
+{"enabled":false}
+EOF
+    (cd "$COMPOSE_DIR" && docker compose stop telegraf-vsphere >/dev/null 2>&1 || true)
+  fi
+
+  read -r -p "Configure Redfish server/BMC monitoring (iDRAC/iLO/XClarity/etc.)? [y/N]: " ans
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    read -r -p "Shared read-only BMC username: " rf_user
+    read -r -s -p "Shared BMC password: " rf_pass; echo
+    [[ -n "$rf_user" && -n "$rf_pass" ]] || die "BMC username/password cannot be empty."
+    targets_json='[]'
+    echo "Enter BMC IPs/hostnames one at a time; press Enter on an empty line when done."
+    while true; do
+      read -r -p "BMC target: " target
+      [[ -n "$target" ]] || break
+      [[ "$target" =~ ^[A-Za-z0-9._:-]+$ ]] || die "Invalid BMC target '$target'."
+      targets_json="$(jq -c --arg t "$target" '. + [$t] | unique' <<<"$targets_json")"
+    done
+    [[ "$(jq 'length' <<<"$targets_json")" -gt 0 ]] || die "At least one BMC target is required."
+    {
+      echo 'address: 0.0.0.0'
+      echo 'port: 9348'
+      echo 'timeout: 20'
+      echo 'hosts:'
+      printf "  default:\n    username: '%s'\n    password: '%s'\n    scheme: https\n" "$(printf '%s' "$rf_user" | sed "s/'/''/g")" "$(printf '%s' "$rf_pass" | sed "s/'/''/g")"
+      cat <<'EOF'
+metrics:
+  system: true
+  sensors: true
+  power: true
+  storage: true
+  memory: true
+  network: true
+  manager: true
+EOF
+    } | write_file "$CONFIG_DIR/redfish/idrac.yml" 0600 root:root
+    jq -n --argjson targets "$targets_json" '{enabled:true,targets:$targets}' | write_file "$ETC_ROOT/redfish.json" 0600 root:root
+    jq -n --argjson ts "$targets_json" '[ $ts[] | {targets:[.],labels:{source:"redfish"}} ]' | write_file "$CONFIG_DIR/prometheus/redfish-targets.json" 0640 root:discovery-ova
+    (cd "$COMPOSE_DIR" && docker compose --profile redfish up -d redfish-exporter)
+  else
+    write_file "$ETC_ROOT/redfish.json" 0600 root:root <<'EOF'
+{"enabled":false,"targets":[]}
+EOF
+    write_file "$CONFIG_DIR/prometheus/redfish-targets.json" 0640 root:discovery-ova <<'EOF'
+[]
+EOF
+    (cd "$COMPOSE_DIR" && docker compose stop redfish-exporter >/dev/null 2>&1 || true)
+  fi
+
+  read -r -p "Configure Pure FlashArray native OpenMetrics monitoring? [y/N]: " ans
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    pure_json='[]'
+    echo "This uses the FlashArray native OpenMetrics endpoint (Purity//FA 6.6.11+)."
+    while true; do
+      read -r -p "FlashArray short name (empty when finished): " name
+      [[ -n "$name" ]] || break
+      [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "Array name may contain only letters, digits, _ and -."
+      safe_name="${name//-/_}"
+      read -r -p "FlashArray management hostname/IP[:port]: " address
+      [[ "$address" =~ ^[A-Za-z0-9._-]+(:[0-9]{1,5})?$ ]] || die "Invalid FlashArray address (use DNS/IPv4 with optional port)."
+      [[ "$address" == *:* ]] || address="${address}:443"
+      read -r -s -p "Read-only FlashArray API token: " token; echo
+      [[ -n "$token" && "$token" != *$'\n'* && "$token" != *"'"* ]] || die "Invalid API token format."
+      read -r -p "Allow self-signed/unverified FlashArray TLS certificate? [Y/n]: " ans
+      [[ "$ans" =~ ^[Nn]$ ]] && insecure=false || insecure=true
+      pure_json="$(jq -c --arg n "$safe_name" --arg a "$address" --arg t "$token" --argjson i "$insecure" '. + [{name:$n,address:$a,token:$t,insecure:$i}]' <<<"$pure_json")"
+    done
+    [[ "$(jq 'length' <<<"$pure_json")" -gt 0 ]] || die "At least one FlashArray is required when Pure monitoring is enabled."
+    jq -n --argjson arrays "$pure_json" '{enabled:true,arrays:$arrays}' | write_file "$ETC_ROOT/pure-monitoring.json" 0600 root:root
+  else
+    write_file "$ETC_ROOT/pure-monitoring.json" 0600 root:root <<'EOF'
+{"enabled":false,"arrays":[]}
+EOF
+  fi
+
+  write_prometheus_config
+  if docker ps --format '{{.Names}}' | grep -Fxq discovery-ova-prometheus; then
+    if docker exec discovery-ova-prometheus promtool check config /etc/prometheus/prometheus.yml >/dev/null 2>&1; then
+      curl -fsS -X POST http://127.0.0.1:9090/-/reload >/dev/null || docker restart discovery-ova-prometheus >/dev/null
+    else
+      die "Prometheus rejected the generated remote-monitoring configuration."
+    fi
+  fi
+  echo "Remote monitoring configuration updated."
+}
+
+write_observability_configs() {
+  install -d -m 0750 "$CONFIG_DIR/prometheus" "$CONFIG_DIR/loki" "$CONFIG_DIR/alloy" "$CONFIG_DIR/grafana/provisioning/datasources" "$CONFIG_DIR/grafana/provisioning/dashboards" "$CONFIG_DIR/grafana/dashboards"
+
+  write_remote_base_configs
+  write_prometheus_config
 
   write_file "$CONFIG_DIR/loki/loki.yml" 0644 root:root <<'EOF'
 auth_enabled: false
@@ -1389,7 +1737,7 @@ EOF
     },
     {
       "type": "stat",
-      "title": "Wi-Fi Signal",
+      "title": "Guacamole",
       "gridPos": {
         "h": 4,
         "w": 4,
@@ -1402,7 +1750,7 @@ EOF
       },
       "targets": [
         {
-          "expr": "discovery_ova_wifi_signal_percent",
+          "expr": "discovery_ova_guacamole_up",
           "refId": "A"
         }
       ],
@@ -1411,7 +1759,7 @@ EOF
           "color": {
             "mode": "thresholds"
           },
-          "unit": "percent",
+          "unit": "none",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -1420,12 +1768,8 @@ EOF
                 "value": null
               },
               {
-                "color": "yellow",
-                "value": 40
-              },
-              {
                 "color": "green",
-                "value": 65
+                "value": 1
               }
             ]
           }
@@ -1813,6 +2157,30 @@ EOF
   "version": 1
 }
 EOF
+
+
+  write_file "$CONFIG_DIR/grafana/dashboards/discovery-ova-remote.json" 0644 root:root <<'EOF'
+{
+  "annotations":{"list":[]},
+  "editable":true,
+  "panels":[
+    {"type":"stat","title":"Remote Probes Up","gridPos":{"h":5,"w":6,"x":0,"y":0},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(probe_success)","refId":"A"}],"fieldConfig":{"defaults":{"color":{"mode":"thresholds"},"thresholds":{"mode":"absolute","steps":[{"color":"red","value":null},{"color":"green","value":1}]}},"overrides":[]}},
+    {"type":"stat","title":"Remote Probes Total","gridPos":{"h":5,"w":6,"x":6,"y":0},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"count(probe_success)","refId":"A"}]},
+    {"type":"stat","title":"vSphere Collector","gridPos":{"h":5,"w":6,"x":12,"y":0},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"max(up{job=\"vsphere\"})","refId":"A"}]},
+    {"type":"stat","title":"Redfish Targets Up","gridPos":{"h":5,"w":6,"x":18,"y":0},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(up{job=\"redfish\"})","refId":"A"}]},
+    {"type":"timeseries","title":"Remote Probe Duration","gridPos":{"h":9,"w":12,"x":0,"y":5},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"probe_duration_seconds","legendFormat":"{{instance}}","refId":"A"}]},
+    {"type":"timeseries","title":"Pure FlashArray Scrape Health","gridPos":{"h":9,"w":12,"x":12,"y":5},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"up{job=~\"purefa_.*\"}","legendFormat":"{{job}} {{instance}}","refId":"A"}]}
+  ],
+  "refresh":"30s",
+  "schemaVersion":41,
+  "tags":["discovery-ova","remote","infrastructure"],
+  "time":{"from":"now-6h","to":"now"},
+  "timezone":"browser",
+  "title":"Discovery-OVA Remote Infrastructure",
+  "uid":"discovery-remote",
+  "version":1
+}
+EOF
 }
 
 write_compose() {
@@ -1837,9 +2205,18 @@ GRAFANA_ADMIN_PASSWORD=$GRAFANA_SECRET_KEY
 GRAFANA_SECRET_KEY=$GRAFANA_SECRET_KEY
 LIBRESPEED_RESULTS_PASSWORD=$LIBRESPEED_RESULTS_PASSWORD
 SNMP_COMMUNITY=$SNMP_COMMUNITY
+GUAC_DB_PASSWORD=$GUAC_DB_PASSWORD
+GUAC_DB_ROOT_PASSWORD=$GUAC_DB_ROOT_PASSWORD
 CAPTURE_IF=$CAPTURE_IF
 NTOP_IMAGE=$ntop_image
 EOF
+
+  if [[ ! -s "$CONFIG_DIR/guacamole/initdb.sql" ]]; then
+    log "Generating Apache Guacamole database schema from $GUACAMOLE_IMAGE."
+    docker pull "$GUACAMOLE_IMAGE" >/dev/null
+    docker run --rm "$GUACAMOLE_IMAGE" /opt/guacamole/bin/initdb.sh --mysql > "$CONFIG_DIR/guacamole/initdb.sql"
+    chmod 0644 "$CONFIG_DIR/guacamole/initdb.sql"
+  fi
 
   write_file "$COMPOSE_DIR/compose.yml" 0640 root:discovery-ova <<EOF
 name: discovery-ova
@@ -1972,9 +2349,93 @@ services:
     restart: unless-stopped
 
 
+  guacamole-db:
+    image: $MARIADB_IMAGE
+    container_name: discovery-ova-guacamole-db
+    environment:
+      TZ: \${TZ}
+      MARIADB_ROOT_PASSWORD: \${GUAC_DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: guacamole_db
+      MARIADB_USER: guacamole_user
+      MARIADB_PASSWORD: \${GUAC_DB_PASSWORD}
+    volumes:
+      - $DATA_DIR/guacamole-db:/var/lib/mysql
+      - $CONFIG_DIR/guacamole/initdb.sql:/docker-entrypoint-initdb.d/001-initdb.sql:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+
+  guacd:
+    image: $GUACD_IMAGE
+    container_name: discovery-ova-guacd
+    restart: unless-stopped
+
+  guacamole:
+    image: $GUACAMOLE_IMAGE
+    container_name: discovery-ova-guacamole
+    depends_on:
+      guacd: {condition: service_started}
+      guacamole-db: {condition: service_healthy}
+    environment:
+      GUACD_HOSTNAME: guacd
+      GUACD_PORT: "4822"
+      MYSQL_ENABLED: "true"
+      MYSQL_HOSTNAME: guacamole-db
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: guacamole_db
+      MYSQL_USERNAME: guacamole_user
+      MYSQL_PASSWORD: \${GUAC_DB_PASSWORD}
+      MYSQL_DRIVER: mariadb
+      WEBAPP_CONTEXT: guacamole
+    ports:
+      - "127.0.0.1:8085:8080"
+    restart: unless-stopped
+
+  blackbox-exporter:
+    image: $BLACKBOX_IMAGE
+    container_name: discovery-ova-blackbox-exporter
+    cap_add: ["NET_RAW"]
+    command:
+      - --config.file=/config/blackbox.yml
+      - --config.enable-auto-reload
+    volumes:
+      - $CONFIG_DIR/blackbox/blackbox.yml:/config/blackbox.yml:ro
+    ports:
+      - "127.0.0.1:9115:9115"
+    restart: unless-stopped
+
+  telegraf-vsphere:
+    profiles: ["vsphere"]
+    image: $TELEGRAF_IMAGE
+    container_name: discovery-ova-telegraf-vsphere
+    env_file:
+      - $ETC_ROOT/vsphere.env
+    volumes:
+      - $CONFIG_DIR/telegraf/vsphere.conf:/etc/telegraf/telegraf.conf:ro
+    ports:
+      - "127.0.0.1:9273:9273"
+    restart: unless-stopped
+
+  redfish-exporter:
+    profiles: ["redfish"]
+    image: $REDFISH_IMAGE
+    container_name: discovery-ova-redfish-exporter
+    user: "0:0"
+    command: ["-config", "/etc/prometheus/idrac.yml"]
+    volumes:
+      - $CONFIG_DIR/redfish/idrac.yml:/etc/prometheus/idrac.yml:ro
+    ports:
+      - "127.0.0.1:9348:9348"
+    restart: unless-stopped
+
+
   prometheus:
     image: $PROMETHEUS_IMAGE
     container_name: discovery-ova-prometheus
+    group_add: ["\${PGID}"]
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -1982,6 +2443,8 @@ services:
       - --web.enable-lifecycle
     volumes:
       - $CONFIG_DIR/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - $CONFIG_DIR/prometheus/blackbox-targets.json:/etc/prometheus/blackbox-targets.json:ro
+      - $CONFIG_DIR/prometheus/redfish-targets.json:/etc/prometheus/redfish-targets.json:ro
       - $DATA_DIR/prometheus:/prometheus
     ports:
       - "127.0.0.1:9090:9090"
@@ -2070,7 +2533,7 @@ EOF
 
   log "Waiting for core HTTP endpoints."
   local url
-  for url in http://127.0.0.1:8001 http://127.0.0.1:8002 http://127.0.0.1:8003 http://127.0.0.1:3000 http://127.0.0.1:3001; do
+  for url in http://127.0.0.1:8001 http://127.0.0.1:8002 http://127.0.0.1:8003 http://127.0.0.1:3000 http://127.0.0.1:3001 http://127.0.0.1:8085/guacamole/ http://127.0.0.1:9115/metrics; do
     for _ in {1..60}; do
       curl -fsS --max-time 2 "$url" >/dev/null 2>&1 && break
       sleep 3
@@ -2196,20 +2659,30 @@ a.card{display:block;text-decoration:none;color:inherit;background:var(--card);b
 a.card:hover{transform:translateY(-2px);border-color:var(--accent);box-shadow:0 8px 28px #0007}.card b{display:block;font-size:19px;margin-bottom:8px}.card span{color:var(--muted);line-height:1.45}.tag{display:inline-block;margin-top:12px;color:var(--accent);font-size:12px;letter-spacing:.08em;text-transform:uppercase}
 footer{margin-top:34px;color:var(--muted);font-size:12px}
 </style></head><body><main>
-<h1>DISCOVERY-OVA</h1><div class="sub">Portable network operations, monitoring and packet-capture appliance</div>
-<div class="grid">
+<h1>DISCOVERY-OVA</h1><div class="sub">Portable infrastructure discovery, remote monitoring, diagnostics and access appliance</div>
+<h2>Monitoring</h2><div class="grid">
 <a class="card" href="https://$HOSTNAME_SHORT.local:8443/" target="_blank" rel="noopener noreferrer"><b>LibreNMS</b><span>Network discovery, SNMP polling and alerting.</span><i class="tag">monitor</i></a>
 <a class="card" href="https://$HOSTNAME_SHORT.local:8444/smokeping/" target="_blank" rel="noopener noreferrer"><b>SmokePing</b><span>Latency and packet-loss history.</span><i class="tag">latency</i></a>
 <a class="card" href="https://$HOSTNAME_SHORT.local:8445/" target="_blank" rel="noopener noreferrer"><b>LibreSpeed</b><span>Local browser-based throughput testing.</span><i class="tag">speed</i></a>
 <a class="card" href="https://$HOSTNAME_SHORT.local:8446/" target="_blank" rel="noopener noreferrer"><b>ntopng</b><span>Passive traffic and flow analysis on the capture NIC.</span><i class="tag">traffic</i></a>
 <a class="card" href="https://$HOSTNAME_SHORT.local:8447/" target="_blank" rel="noopener noreferrer"><b>Grafana</b><span>Discovery-OVA Overview metrics and centralized syslog.</span><i class="tag">observability</i></a>
+<a class="card" href="/remote/" target="_blank" rel="noopener noreferrer"><b>Remote Service Probes <small id="st-blackbox"></small></b><span>Manage ICMP, HTTP/HTTPS, TCP and DNS availability probes.</span><i class="tag">blackbox</i></a>
+<a class="card" href="https://$HOSTNAME_SHORT.local:8447/d/discovery-remote/discovery-ova-remote-infrastructure" target="_blank" rel="noopener noreferrer"><b>Remote Infrastructure <small id="st-remote"></small></b><span>vSphere, Redfish server hardware and Pure FlashArray monitoring.</span><i class="tag">infrastructure</i></a>
+<a class="card" href="/guacamole/" target="_blank" rel="noopener noreferrer"><b>Guacamole <small id="st-guac"></small></b><span>Browser-based RDP, SSH and VNC access to remote systems.</span><i class="tag">remote access</i></a>
 <a class="card" href="/scanner/" target="_blank" rel="noopener noreferrer"><b>Network Scanner</b><span>Nmap quick/deep scans with saved history and change tracking.</span><i class="tag">active scan</i></a>
 <a class="card" href="/network/" target="_blank" rel="noopener noreferrer"><b>Network Control</b><span>Management path, capture mode and rollback status.</span><i class="tag">control</i></a>
-<a class="card" href="/wireless/" target="_blank" rel="noopener noreferrer"><b>Wireless Survey</b><span>NetworkManager Wi-Fi survey when a radio is present or passed through.</span><i class="tag">wifi</i></a>
 <a class="card" href="/capture/" target="_blank" rel="noopener noreferrer"><b>Packet Capture</b><span>Bounded PCAP capture with validated BPF filters.</span><i class="tag">pcap</i></a>
 <a class="card" href="/diagnostics/" target="_blank" rel="noopener noreferrer"><b>Network Diagnostics</b><span>iperf3 throughput tests and LLDP neighbor visibility.</span><i class="tag">diagnostics</i></a>
 <a class="card" href="/status/" target="_blank" rel="noopener noreferrer"><b>Appliance Status</b><span>Interfaces, routes, services, containers and health.</span><i class="tag">status</i></a>
-</div><footer>Discovery-OVA $VERSION · $HOSTNAME_SHORT.local</footer></main></body></html>
+</div><footer>Discovery-OVA $VERSION · $HOSTNAME_SHORT.local</footer>
+<script>
+fetch('/api/summary').then(r=>r.json()).then(s=>{
+ const dot=(ok)=>ok?' · UP':' · DOWN';
+ document.getElementById('st-guac').textContent=dot(s.guacamole_up);
+ document.getElementById('st-blackbox').textContent=' · '+s.blackbox_targets+' targets';
+ document.getElementById('st-remote').textContent=' · '+(s.vsphere?'vSphere ':'')+(s.redfish_targets?s.redfish_targets+' BMC ':'')+(s.pure_arrays?s.pure_arrays+' Pure':'');
+}).catch(()=>{});
+</script></main></body></html>
 EOF
 
   backup_path /etc/nginx/sites-enabled/default
@@ -2237,10 +2710,22 @@ server {
     location = / { try_files /index.html =404; }
     location /scanner/ { proxy_pass http://127.0.0.1:8787; include proxy_params; proxy_read_timeout 920s; }
     location /network/ { proxy_pass http://127.0.0.1:8787; include proxy_params; }
-    location /wireless/ { proxy_pass http://127.0.0.1:8787; include proxy_params; }
     location /capture/ { proxy_pass http://127.0.0.1:8787; include proxy_params; proxy_read_timeout 650s; }
     location /captures/ { proxy_pass http://127.0.0.1:8787; include proxy_params; }
     location /diagnostics/ { proxy_pass http://127.0.0.1:8787; include proxy_params; proxy_read_timeout 90s; }
+    location /remote/ { proxy_pass http://127.0.0.1:8787; include proxy_params; }
+    location /api/ { proxy_pass http://127.0.0.1:8787; include proxy_params; }
+    location /guacamole/ {
+        proxy_pass http://127.0.0.1:8085;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
     location /status/ { proxy_pass http://127.0.0.1:8787; include proxy_params; }
     location /health { proxy_pass http://127.0.0.1:8787; include proxy_params; }
 }
@@ -2311,7 +2796,7 @@ EOF
   log "HTTPS portal validated."
 }
 write_control_app() {
-  stage 6 "Scanner, network control, wireless survey and packet-capture interfaces"
+  stage 6 "Scanner, network control, remote monitoring and packet-capture interfaces"
   write_file "$APP_DIR/discovery_ova_web.py" 0750 root:discovery-ova <<'PY'
 #!/usr/bin/env python3
 import datetime as dt
@@ -2343,6 +2828,9 @@ CAP_DIR = DATA / 'captures'
 RUN = Path('/run/discovery-ova')
 PID_FILE = RUN / 'capture.pid'
 META_FILE = RUN / 'capture.json'
+PROM_CONFIG = Path('/opt/discovery-ova/config/prometheus')
+BLACKBOX_TARGETS = PROM_CONFIG / 'blackbox-targets.json'
+ETC = Path('/etc/discovery-ova')
 CAP_DIR.mkdir(parents=True, exist_ok=True)
 RUN.mkdir(parents=True, exist_ok=True)
 
@@ -2357,7 +2845,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1p
 </style>'''
 
 def page(title, body):
-    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title>{BASE_STYLE}</head><body><main><h1>{html.escape(title)}</h1><div class="sub">Discovery-OVA network operations appliance</div><div class="nav"><a href="/">Portal</a><a href="/scanner/">Scanner</a><a href="/network/">Network</a><a href="/wireless/">Wireless</a><a href="/capture/">Capture</a><a href="/diagnostics/">Diagnostics</a><a href="/status/">Status</a></div>{body}</main></body></html>'''
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title>{BASE_STYLE}</head><body><main><h1>{html.escape(title)}</h1><div class="sub">Discovery-OVA network operations appliance</div><div class="nav"><a href="/">Portal</a><a href="/scanner/">Scanner</a><a href="/network/">Network</a><a href="/remote/">Remote</a><a href="/capture/">Capture</a><a href="/diagnostics/">Diagnostics</a><a href="/status/">Status</a></div>{body}</main></body></html>'''
 
 def run(args, timeout=15, check=False):
     return subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=check)
@@ -2572,21 +3060,6 @@ def network():
     body=f'''{msg}<div class="box"><div class="row"><form method="post"><button name="action" value="capture">Enter capture</button></form><form method="post"><button name="action" value="confirm">Confirm capture</button></form><form method="post"><button name="action" value="wired">Test wired DHCP</button></form><form method="post"><button name="action" value="rollback">Rollback</button></form></div></div><div class="box"><pre>{html.escape(status.stdout+status.stderr)}</pre></div>'''
     return page('Network Control',body)
 
-@APP.get('/wireless/')
-def wireless():
-    devs=run(['/usr/bin/nmcli','-t','-f','DEVICE,TYPE,STATE','device'],timeout=10)
-    wifi=[line.split(':',1)[0] for line in devs.stdout.splitlines() if ':wifi:' in line]
-    if not wifi:
-        body='<div class="box">No NetworkManager Wi-Fi device is present. In a VM this page becomes active only if a supported Wi-Fi adapter is passed through to the guest.</div>'
-        return page('Wireless Survey',body)
-    cp=run(['/usr/bin/nmcli','-t','--escape','yes','-f','IN-USE,SSID,BSSID,SIGNAL,CHAN,FREQ,SECURITY','dev','wifi','list','--rescan','yes'],timeout=30)
-    rows=''
-    for line in cp.stdout.splitlines():
-        cols=line.split(':')
-        cols += ['']*(7-len(cols))
-        rows += '<tr>'+''.join(f'<td>{html.escape(c)}</td>' for c in cols[:7])+'</tr>'
-    body=f'<div class="box"><table><tr><th>In use</th><th>SSID</th><th>BSSID</th><th>Signal</th><th>Channel</th><th>Freq</th><th>Security</th></tr>{rows}</table></div><div class="box">This is a NetworkManager survey. It does not claim monitor-mode support.</div>'
-    return page('Wireless Survey',body)
 
 def capture_running():
     if not PID_FILE.exists(): return False, None
@@ -2755,6 +3228,88 @@ def diagnostics():
 <div class="box"><h3>Recent iperf3 tests</h3><table><tr><th>ID</th><th>Target</th><th>Mode</th><th>Run</th><th>Started</th><th>RC</th><th>Summary</th></tr>{rows}</table></div>'''
     return page('Network Diagnostics', body)
 
+
+def validate_probe_target(module, value):
+    value=value.strip()
+    if not value or len(value)>500 or any(c in value for c in '\r\n\x00'):
+        raise ValueError('invalid probe target')
+    if module in ('http_2xx','https_insecure'):
+        from urllib.parse import urlparse
+        u=urlparse(value)
+        if u.scheme not in ('http','https') or not u.hostname:
+            raise ValueError('HTTP probes require an http:// or https:// URL')
+        return value
+    if module=='tcp_connect':
+        if not re.fullmatch(r'[A-Za-z0-9._:-]+:[0-9]{1,5}',value):
+            raise ValueError('TCP target must be hostname:port or IPv4:port')
+        port=int(value.rsplit(':',1)[1])
+        if not (1 <= port <= 65535): raise ValueError('invalid TCP port')
+        return value
+    return validate_host(value)
+
+def read_json(path, default):
+    try: return json.loads(Path(path).read_text())
+    except Exception: return default
+
+def atomic_json(path, obj):
+    path=Path(path); tmp=path.with_suffix(path.suffix+'.tmp')
+    tmp.write_text(json.dumps(obj,indent=2)+'\n'); os.chmod(tmp,0o640); os.replace(tmp,path)
+
+def container_running(name):
+    cp=run(['/usr/bin/docker','inspect','-f','{{.State.Running}}',name],timeout=5)
+    return cp.returncode==0 and cp.stdout.strip()=='true'
+
+@APP.route('/remote/', methods=['GET','POST'])
+def remote_monitoring():
+    msg=''
+    modules={'icmp':'ICMP','http_2xx':'HTTP/HTTPS 2xx','https_insecure':'HTTPS (allow self-signed)','tcp_connect':'TCP connect','dns_udp':'DNS server'}
+    targets=read_json(BLACKBOX_TARGETS,[])
+    if request.method=='POST':
+        action=request.form.get('action','')
+        try:
+            if action=='add_probe':
+                module=request.form.get('module','icmp')
+                if module not in modules: raise ValueError('invalid probe module')
+                target=validate_probe_target(module,request.form.get('target',''))
+                name=request.form.get('name','').strip()[:80] or target
+                entry={'targets':[target],'labels':{'module':module,'name':name}}
+                targets=[x for x in targets if not (x.get('targets')==[target] and x.get('labels',{}).get('module')==module)]
+                targets.append(entry); atomic_json(BLACKBOX_TARGETS,targets)
+                msg='<div class="box ok">Probe saved. Prometheus file discovery will pick it up automatically.</div>'
+            elif action=='delete_probe':
+                idx=int(request.form.get('index','-1'))
+                if not (0<=idx<len(targets)): raise ValueError('invalid probe index')
+                targets.pop(idx); atomic_json(BLACKBOX_TARGETS,targets)
+                msg='<div class="box ok">Probe removed.</div>'
+            else: raise ValueError('invalid action')
+        except Exception as e:
+            msg=f'<div class="box bad">{html.escape(str(e))}</div>'
+    rows=''
+    for i,x in enumerate(targets):
+        t=(x.get('targets') or [''])[0]; lab=x.get('labels') or {}; mod=lab.get('module','')
+        rows += f'<tr><td>{html.escape(lab.get("name",t))}</td><td>{html.escape(t)}</td><td>{html.escape(modules.get(mod,mod))}</td><td><form method="post"><input type="hidden" name="index" value="{i}"><button name="action" value="delete_probe">Delete</button></form></td></tr>'
+    vs=read_json(ETC/'vsphere.json',{'enabled':False}); rf=read_json(ETC/'redfish.json',{'enabled':False,'targets':[]}); pure=read_json(ETC/'pure-monitoring.json',{'enabled':False,'arrays':[]})
+    opts=''.join(f'<option value="{html.escape(k)}">{html.escape(v)}</option>' for k,v in modules.items())
+    body=f'''{msg}<div class="box"><h3>Remote service probes</h3><form method="post"><input type="hidden" name="action" value="add_probe"><div class="row"><input class="grow" name="name" placeholder="Friendly name"><input class="grow" name="target" placeholder="IP, URL, hostname:port" required><select name="module">{opts}</select><button>Add probe</button></div></form><table><tr><th>Name</th><th>Target</th><th>Probe</th><th></th></tr>{rows}</table></div>
+<div class="box"><h3>Remote infrastructure collectors</h3><table>
+<tr><td>VMware vSphere</td><td>{'configured' if vs.get('enabled') else 'disabled'}</td><td>{html.escape(str(vs.get('url','')))}</td></tr>
+<tr><td>Redfish server hardware</td><td>{'configured' if rf.get('enabled') else 'disabled'}</td><td>{len(rf.get('targets',[]))} BMC target(s)</td></tr>
+<tr><td>Pure FlashArray</td><td>{'configured' if pure.get('enabled') else 'disabled'}</td><td>{len(pure.get('arrays',[]))} array(s)</td></tr></table>
+<p class="sub">Configure or rotate infrastructure credentials at the appliance console with <code>sudo discovery-ova-installer remote</code>. Secrets are intentionally not accepted by this web page.</p><p><a href="https://{html.escape(CONF.get('HOSTNAME_SHORT','discovery-ova'))}.local:8447/d/discovery-remote/discovery-ova-remote-infrastructure" target="_blank" rel="noopener noreferrer">Open the Remote Infrastructure Grafana dashboard</a></p></div>'''
+    return page('Remote Monitoring',body)
+
+@APP.get('/api/summary')
+def api_summary():
+    targets=read_json(BLACKBOX_TARGETS,[]); vs=read_json(ETC/'vsphere.json',{}); rf=read_json(ETC/'redfish.json',{}); pure=read_json(ETC/'pure-monitoring.json',{})
+    return {
+      'guacamole_up':container_running('discovery-ova-guacamole'),
+      'blackbox_up':container_running('discovery-ova-blackbox-exporter'),
+      'blackbox_targets':len(targets),
+      'vsphere':bool(vs.get('enabled')),
+      'redfish_targets':len(rf.get('targets',[])) if rf.get('enabled') else 0,
+      'pure_arrays':len(pure.get('arrays',[])) if pure.get('enabled') else 0
+    }
+
 @APP.get('/status/')
 def status():
     sections=[]
@@ -2803,7 +3358,7 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=$DATA_DIR/scanner $DATA_DIR/captures $RUN_ROOT
+ReadWritePaths=$DATA_DIR/scanner $DATA_DIR/captures $RUN_ROOT $CONFIG_DIR/prometheus
 
 [Install]
 WantedBy=multi-user.target
@@ -2848,6 +3403,12 @@ udp=0; ss -lunH | grep -Eq '(^|[[:space:]])[^ ]*:514[[:space:]]' && udp=1 || tru
 tcp=0; ss -ltnH | grep -Eq '(^|[[:space:]])[^ ]*:514[[:space:]]' && tcp=1 || true
 capture_active=0
 [[ -r /run/discovery-ova/capture.pid ]] && kill -0 "$(cat /run/discovery-ova/capture.pid)" 2>/dev/null && capture_active=1 || true
+guacamole_up=0; docker inspect -f '{{.State.Running}}' discovery-ova-guacamole 2>/dev/null | grep -qx true && guacamole_up=1 || true
+blackbox_up=0; docker inspect -f '{{.State.Running}}' discovery-ova-blackbox-exporter 2>/dev/null | grep -qx true && blackbox_up=1 || true
+blackbox_targets="$(jq 'length' /opt/discovery-ova/config/prometheus/blackbox-targets.json 2>/dev/null || echo 0)"
+vsphere_configured=0; [[ "$(jq -r '.enabled // false' /etc/discovery-ova/vsphere.json 2>/dev/null || echo false)" == true ]] && vsphere_configured=1 || true
+redfish_targets="$(jq 'if .enabled then (.targets|length) else 0 end' /etc/discovery-ova/redfish.json 2>/dev/null || echo 0)"
+pure_arrays="$(jq 'if .enabled then (.arrays|length) else 0 end' /etc/discovery-ova/pure-monitoring.json 2>/dev/null || echo 0)"
 backup_ts=0; backup_ok=0
 if [[ -r /var/lib/discovery-ova/backup.status ]]; then
   backup_ts="$(awk -F= '$1=="timestamp"{print $2}' /var/lib/discovery-ova/backup.status | tail -1)"
@@ -2855,14 +3416,6 @@ if [[ -r /var/lib/discovery-ova/backup.status ]]; then
 fi
 [[ "$backup_ts" =~ ^[0-9]+$ ]] || backup_ts=0
 [[ "$backup_ok" =~ ^[01]$ ]] || backup_ok=0
-wifi_dev="$(nmcli -t -f DEVICE,TYPE dev 2>/dev/null | awk -F: '$2=="wifi"{print $1;exit}')"
-wifi_ssid=""; wifi_signal=0; wifi_connected=0
-if [[ -n "$wifi_dev" ]]; then
-  wifi_ssid="$(nmcli -t -f ACTIVE,SSID,SIGNAL dev wifi 2>/dev/null | awk -F: '$1=="yes"{print $2;exit}')"
-  wifi_signal="$(nmcli -t -f ACTIVE,SSID,SIGNAL dev wifi 2>/dev/null | awk -F: '$1=="yes"{print $3;exit}')"
-  [[ -n "$wifi_ssid" ]] && wifi_connected=1
-  [[ "$wifi_signal" =~ ^[0-9]+$ ]] || wifi_signal=0
-fi
 cat >"$TMP" <<METRICS
 # HELP discovery_ova_management_up Primary management gateway validation.
 # TYPE discovery_ova_management_up gauge
@@ -2880,10 +3433,14 @@ discovery_ova_iperf3_server_active $iperf_server
 discovery_ova_syslog_udp_listener $udp
 discovery_ova_syslog_tcp_listener $tcp
 discovery_ova_packet_capture_active $capture_active
+discovery_ova_guacamole_up $guacamole_up
+discovery_ova_blackbox_exporter_up $blackbox_up
+discovery_ova_blackbox_target_count $blackbox_targets
+discovery_ova_vsphere_configured $vsphere_configured
+discovery_ova_redfish_target_count $redfish_targets
+discovery_ova_pure_array_count $pure_arrays
 discovery_ova_last_backup_success $backup_ok
 discovery_ova_last_backup_timestamp_seconds $backup_ts
-discovery_ova_wifi_connected{interface="$(esc "$wifi_dev")",ssid="$(esc "$wifi_ssid")"} $wifi_connected
-discovery_ova_wifi_signal_percent{interface="$(esc "$wifi_dev")",ssid="$(esc "$wifi_ssid")"} $wifi_signal
 $(for svc in docker nginx rsyslog lldpd discovery-ova-web; do v=0; systemctl is-active --quiet "$svc.service" && v=1 || true; printf 'discovery_ova_service_up{service="%s"} %s\n' "$svc" "$v"; done)
 $(for timer in discovery-ova-field-metrics discovery-ova-backup; do v=0; systemctl is-active --quiet "$timer.timer" && v=1 || true; printf 'discovery_ova_timer_up{timer="%s"} %s\n' "$timer" "$v"; done)
 discovery_ova_collector_generation_timestamp_seconds $(date +%s)
@@ -2951,17 +3508,9 @@ def route(dev): return out(['ip','-4','route','show','default','dev',dev])
 ip=addr(mg); gw=route(mg); active_mg=mg
 if not ip or not gw:
     ip=addr(cap); gw=route(cap); active_mg=cap
-ssid=''
-wifi=out(['nmcli','-t','-f','DEVICE,TYPE','dev'])
-for line in wifi.splitlines():
-    if line.endswith(':wifi'):
-        ss=out(['nmcli','-t','-f','ACTIVE,SSID','dev','wifi'])
-        for x in ss.splitlines():
-            if x.startswith('yes:'): ssid=x[4:]; break
-        break
 profile=out(['nmcli','-t','-f','GENERAL.CONNECTION','dev','show',cap]).split(':',1)
 profile=profile[1] if len(profile)>1 else ''
-body=f'''Hostname: {socket.gethostname()}\nTimestamp: {datetime.now(timezone.utc).isoformat()}\nManagement interface: {active_mg}\nIPv4: {ip}\nDefault route: {gw}\nWi-Fi SSID: {ssid or '(none)'}\nEthernet/capture profile: {profile}\n'''
+body=f'''Hostname: {socket.gethostname()}\nTimestamp: {datetime.now(timezone.utc).isoformat()}\nManagement interface: {active_mg}\nIPv4: {ip}\nDefault route: {gw}\nEthernet/capture profile: {profile}\n'''
 msg=EmailMessage(); msg['Subject']=f'Discovery-OVA boot address: {socket.gethostname()} {ip}'; msg['From']=cfg.get('from',cfg['username']); msg['To']=cfg['to']; msg.set_content(body)
 ctx=ssl.create_default_context(); port=int(cfg['port'])
 if port==465:
@@ -3052,7 +3601,7 @@ compose=(docker compose -f "$COMPOSE_DIR/compose.yml" --env-file "$COMPOSE_DIR/.
 cleanup(){ "${compose[@]}" up -d >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 # Quiesce stateful application writers; observability bulk stores are intentionally excluded.
-"${compose[@]}" stop dispatcher librenms db >/dev/null || true
+"${compose[@]}" stop dispatcher librenms db guacamole guacamole-db >/dev/null || true
 include=(
   /opt/discovery-ova/compose
   /opt/discovery-ova/config
@@ -3060,6 +3609,7 @@ include=(
   /opt/discovery-ova/portal
   /opt/discovery-ova/data/librenms
   /opt/discovery-ova/data/db
+  /opt/discovery-ova/data/guacamole-db
   /opt/discovery-ova/data/smokeping/config
   /opt/discovery-ova/data/librespeed
   /opt/discovery-ova/data/scanner
@@ -3081,7 +3631,7 @@ include=(
   /usr/local/sbin/discovery-ova-backup
   /usr/local/sbin/discovery-ova-firstboot
 )
-# Only Discovery-OVA-owned NM profiles are recoverable; never archive unrelated Wi-Fi credentials.
+# Only Discovery-OVA-owned NM profiles are recoverable; never archive unrelated management credentials.
 [[ -e /etc/NetworkManager/system-connections/discovery-ova-capture.nmconnection ]] && include+=(/etc/NetworkManager/system-connections/discovery-ova-capture.nmconnection)
 [[ -e /etc/NetworkManager/system-connections/discovery-ova-wired.nmconnection ]] && include+=(/etc/NetworkManager/system-connections/discovery-ova-wired.nmconnection)
 tar --warning=no-file-changed -czf "$tmp" \
@@ -3194,6 +3744,24 @@ initialize_app_accounts() {
   fi
   rm -f /tmp/discovery-ova-lnms-user.out
 
+  # Guacamole schema ships a guacadmin account. Rename that entity to the shared operator and replace its password before normal use.
+  local guac_pw_b64 guac_sql
+  guac_pw_b64="$(printf '%s' "$OPERATOR_PASSWORD" | base64 -w0)"
+  guac_sql="SET @p=CONVERT(FROM_BASE64('${guac_pw_b64}') USING utf8mb4); SET @salt=UNHEX(SHA2(UUID(),256)); UPDATE guacamole_user u JOIN guacamole_entity e ON u.entity_id=e.entity_id SET u.password_salt=@salt,u.password_hash=UNHEX(SHA2(CONCAT(@p,HEX(@salt)),256)),u.password_date=CURRENT_TIMESTAMP WHERE e.type='USER' AND e.name IN ('guacadmin','${OPERATOR_USER}'); UPDATE guacamole_entity SET name='${OPERATOR_USER}' WHERE type='USER' AND name='guacadmin';"
+  local guac_ready=0
+  for _ in {1..90}; do
+    if docker exec -e MYSQL_PWD="$GUAC_DB_ROOT_PASSWORD" discovery-ova-guacamole-db mariadb -N -uroot guacamole_db -e 'SELECT COUNT(*) FROM guacamole_user;' >/dev/null 2>&1; then
+      guac_ready=1
+      break
+    fi
+    sleep 2
+  done
+  (( guac_ready == 1 )) || die "Guacamole database schema did not become ready. Check discovery-ova-guacamole-db logs."
+  docker exec -e MYSQL_PWD="$GUAC_DB_ROOT_PASSWORD" discovery-ova-guacamole-db mariadb -uroot guacamole_db -e "$guac_sql" >/dev/null \
+    || die "Guacamole operator bootstrap failed. Check the Guacamole database logs."
+  [[ "$(docker exec -e MYSQL_PWD="$GUAC_DB_ROOT_PASSWORD" discovery-ova-guacamole-db mariadb -N -uroot guacamole_db -e "SELECT COUNT(*) FROM guacamole_entity WHERE type='USER' AND name='${OPERATOR_USER}';" 2>/dev/null | tr -d '[:space:]')" == "1" ]] \
+    || die "Guacamole operator account '$OPERATOR_USER' was not created correctly."
+
   warn "ntopng Community uses its own first-login credential. Its current upstream default is admin/admin and it forces a password change on first access. Nginx Basic Auth still protects the proxy."
 }
 
@@ -3253,6 +3821,14 @@ rekey() {
     fi
   fi
 
+  if docker ps --format '{{.Names}}' | grep -Fxq discovery-ova-guacamole-db; then
+    local guac_pw_b64 guac_sql
+    guac_pw_b64="$(printf '%s' "$new_password" | base64 -w0)"
+    guac_sql="SET @p=CONVERT(FROM_BASE64('${guac_pw_b64}') USING utf8mb4); SET @salt=UNHEX(SHA2(UUID(),256)); UPDATE guacamole_user u JOIN guacamole_entity e ON u.entity_id=e.entity_id SET u.password_salt=@salt,u.password_hash=UNHEX(SHA2(CONCAT(@p,HEX(@salt)),256)),u.password_date=CURRENT_TIMESTAMP WHERE e.type='USER' AND e.name='${OPERATOR_USER}';"
+    docker exec -e MYSQL_PWD="$GUAC_DB_ROOT_PASSWORD" discovery-ova-guacamole-db mariadb -uroot guacamole_db -e "$guac_sql" >/dev/null \
+      || warn "Guacamole password could not be updated automatically."
+  fi
+
   htpasswd -bcB /etc/nginx/.discovery-ova.htpasswd "$OPERATOR_USER" "$new_password" >/dev/null
   chmod 0640 /etc/nginx/.discovery-ova.htpasswd
   chown root:www-data /etc/nginx/.discovery-ova.htpasswd
@@ -3265,9 +3841,11 @@ rekey() {
     printf 'GRAFANA_SECRET_KEY=%q\n' "$GRAFANA_SECRET_KEY"
     printf 'LIBRESPEED_RESULTS_PASSWORD=%q\n' "$LIBRESPEED_RESULTS_PASSWORD"
     printf 'SNMP_COMMUNITY=%q\n' "$SNMP_COMMUNITY"
+    printf 'GUAC_DB_PASSWORD=%q\n' "$GUAC_DB_PASSWORD"
+    printf 'GUAC_DB_ROOT_PASSWORD=%q\n' "$GUAC_DB_ROOT_PASSWORD"
   } | write_file "$SECRETS_FILE" 0600 root:root
   systemctl reload nginx
-  log "Operator credential rotated for the Discovery-OVA front door, Grafana and LibreNMS where reachable. ntopng maintains its own credential."
+  log "Operator credential rotated for the Discovery-OVA front door, Grafana, LibreNMS and Guacamole where reachable. ntopng maintains its own credential."
 }
 
 validate() {
@@ -3287,12 +3865,14 @@ validate() {
   check "Portal authentication challenge" bash -c '[[ "$(curl -ksS -o /dev/null -w "%{http_code}" https://127.0.0.1/)" == 401 ]]'
   if [[ -n "${OPERATOR_PASSWORD:-}" ]]; then
     check "Authenticated HTTPS portal" curl -kfsS -u "$OPERATOR_USER:$OPERATOR_PASSWORD" https://127.0.0.1/
+    check "Guacamole web application" curl -fsSL http://127.0.0.1:8085/guacamole/
+    check "Blackbox Exporter metrics" curl -fsS http://127.0.0.1:9115/metrics
   else
     fail "Stored operator credential available for portal test"
   fi
 
   local c
-  for c in discovery-ova-db discovery-ova-redis discovery-ova-librenms discovery-ova-librenms-dispatcher discovery-ova-smokeping discovery-ova-librespeed discovery-ova-ntopng discovery-ova-prometheus discovery-ova-node-exporter discovery-ova-cadvisor discovery-ova-loki discovery-ova-alloy discovery-ova-grafana; do
+  for c in discovery-ova-db discovery-ova-redis discovery-ova-librenms discovery-ova-librenms-dispatcher discovery-ova-smokeping discovery-ova-librespeed discovery-ova-ntopng discovery-ova-guacamole-db discovery-ova-guacd discovery-ova-guacamole discovery-ova-blackbox-exporter discovery-ova-prometheus discovery-ova-node-exporter discovery-ova-cadvisor discovery-ova-loki discovery-ova-alloy discovery-ova-grafana; do
     if [[ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || true)" == true ]]; then pass "Container running: $c"; else fail "Container running: $c"; fi
   done
   for c in NetworkManager docker nginx rsyslog lldpd discovery-ova-web; do
@@ -3314,10 +3894,24 @@ validate() {
   check "Loki ready" curl -fsS --max-time 8 http://127.0.0.1:3100/ready
   check "Alloy ready" curl -fsS --max-time 8 http://127.0.0.1:12345/-/ready
 
-  if curl -fsS http://127.0.0.1:9090/api/v1/targets | jq -e '[.data.activeTargets[] | select(.health != "up")] | length == 0' >/dev/null 2>&1; then
-    pass "All Prometheus active targets healthy"
+  prom_targets="$(curl -fsS http://127.0.0.1:9090/api/v1/targets 2>/dev/null || echo '{}')"
+  if jq -e '[.data.activeTargets[]? | select((.labels.job=="node" or .labels.job=="cadvisor" or .labels.job=="prometheus" or .labels.job=="blackbox-exporter") and .health != "up")] | length == 0' <<<"$prom_targets" >/dev/null 2>&1; then
+    pass "Core Prometheus targets healthy"
   else
-    fail "All Prometheus active targets healthy"
+    fail "Core Prometheus targets healthy"
+  fi
+  remote_bad="$(jq '[.data.activeTargets[]? | select((.labels.job=="blackbox" or .labels.job=="vsphere" or .labels.job=="redfish" or (.labels.job|startswith("purefa_"))) and .health != "up")] | length' <<<"$prom_targets" 2>/dev/null || echo 0)"
+  if [[ "$remote_bad" =~ ^[0-9]+$ ]] && (( remote_bad > 0 )); then
+    vwarn "$remote_bad remote monitored target(s) are currently unhealthy; this does not fail appliance validation"
+  else
+    pass "Remote monitoring targets have no current scrape failures"
+  fi
+  if [[ "$(jq -r '.enabled // false' "$ETC_ROOT/vsphere.json" 2>/dev/null || echo false)" == true ]]; then
+    [[ "$(docker inspect -f '{{.State.Running}}' discovery-ova-telegraf-vsphere 2>/dev/null || true)" == true ]] && pass "vSphere collector container running" || fail "vSphere collector container running"
+  fi
+  if [[ "$(jq -r '.enabled // false' "$ETC_ROOT/redfish.json" 2>/dev/null || echo false)" == true ]]; then
+    [[ "$(docker inspect -f '{{.State.Running}}' discovery-ova-redfish-exporter 2>/dev/null || true)" == true ]] && pass "Redfish exporter container running" || fail "Redfish exporter container running"
+    curl -fsS --max-time 5 http://127.0.0.1:9348/health >/dev/null 2>&1 && pass "Redfish exporter health endpoint" || fail "Redfish exporter health endpoint"
   fi
   if curl -fsSG http://127.0.0.1:9090/api/v1/query --data-urlencode 'query=node_textfile_scrape_error' | jq -e '.data.result | length > 0 and all(.[]; .value[1] == "0")' >/dev/null 2>&1; then
     pass "node_textfile_scrape_error is zero"
@@ -3372,6 +3966,7 @@ validate() {
     grep -Fq 'etc/systemd/system/discovery-ova-network-boot-guard.service' <<<"$archive_list" && pass "Backup contains Discovery-OVA systemd units" || fail "Backup contains Discovery-OVA systemd units"
     grep -Fq 'etc/NetworkManager/system-connections/discovery-ova-capture.nmconnection' <<<"$archive_list" && pass "Backup contains capture NetworkManager profile" || fail "Backup contains capture NetworkManager profile"
     grep -Fq 'opt/discovery-ova/data/scanner/' <<<"$archive_list" && pass "Backup contains scanner state" || fail "Backup contains scanner state"
+    grep -Fq 'opt/discovery-ova/data/guacamole-db/' <<<"$archive_list" && pass "Backup contains Guacamole database state" || fail "Backup contains Guacamole database state"
     if grep -Eq 'opt/discovery-ova/data/(prometheus|loki|ntopng|captures|smokeping/data)(/|$)' <<<"$archive_list"; then
       fail "Backup excludes rebuildable/bulk observability and capture data"
     else
@@ -3446,6 +4041,16 @@ install_all() {
   install_firstboot_identity_service
   initialize_app_accounts
 
+  if [[ "$(jq -r '.enabled // false' "$ETC_ROOT/vsphere.json" 2>/dev/null || echo false)" == false && "$(jq -r '.enabled // false' "$ETC_ROOT/redfish.json" 2>/dev/null || echo false)" == false && "$(jq -r '.enabled // false' "$ETC_ROOT/pure-monitoring.json" 2>/dev/null || echo false)" == false ]]; then
+    local monitor_ans
+    read -r -p "Configure optional remote vSphere, Redfish and Pure monitoring now? [y/N]: " monitor_ans
+    if [[ "$monitor_ans" =~ ^[Yy]$ ]]; then configure_remote_monitoring_interactive; fi
+  else
+    log "Existing remote infrastructure monitoring configuration preserved. Use 'discovery-ova-installer remote' to change it."
+    write_prometheus_config
+    curl -fsS -X POST http://127.0.0.1:9090/-/reload >/dev/null 2>&1 || true
+  fi
+
   # SMTP and Farva are deliberately interactive so no password/private deployment detail enters chat or shell history.
   if [[ ! -r /etc/discovery-ova/ip-email.json ]]; then
     configure_smtp_interactive
@@ -3474,6 +4079,8 @@ Discovery-OVA is ready.
   Operator: $OPERATOR_USER
   Capture:  $CAPTURE_IF (addressless, promiscuous)
   Tools:    https://$HOSTNAME_SHORT.local/diagnostics/ (iperf3 + LLDP)
+  Remote:   https://$HOSTNAME_SHORT.local/remote/
+  Guac:     https://$HOSTNAME_SHORT.local/guacamole/
 
 VMware requirement: connect $CAPTURE_IF's vNIC to the SPAN/mirror destination port group and configure the vSphere networking layer to deliver mirrored traffic to it. The guest installer cannot configure a vSphere Distributed Switch mirror session or port-group security policy.
 
@@ -3491,6 +4098,7 @@ main() {
     rekey) rekey ;;
     smtp) require_root; load_conf; configure_smtp_interactive ;;
     backup-remote) require_root; load_conf; configure_remote_backup_interactive ;;
+    remote) require_root; load_conf; configure_remote_monitoring_interactive ;;
     seal) seal_ova ;;
     discover) discover ;;
     -h|--help|help|'') usage ;;
